@@ -467,7 +467,7 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
 #  UI Panel                                                           
 # ────────────────────────────────────────────────────────────────────
 class LINKEDITOR_PT_panel(bpy.types.Panel):
-    bl_label       = "Link Editor"
+    bl_label       = "Link Manager"
     bl_idname      = "LINKEDITOR_PT_panel"
     bl_space_type  = "VIEW_3D"
     bl_region_type = "UI"
