@@ -471,7 +471,7 @@ class LINKEDITOR_PT_panel(bpy.types.Panel):
     bl_idname      = "LINKEDITOR_PT_panel"
     bl_space_type  = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category    = "Link Editor"
+    bl_category    = "Link Manager"
 
     def draw(self, context):
         scn    = context.scene
