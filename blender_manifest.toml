@@ -1,0 +1,13 @@
+
+schema_version = "1.0.0"
+id = "Link_manager"
+version = "1.0.0"
+name = "Link Manager"
+tagline = "Manage Link, proxy versions"
+maintainer = "BlenderBob"
+type = "add-on"
+
+tags = ["Render"]
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2025 Robert Rioux"]
+blender_version_min = "4.2.0"
