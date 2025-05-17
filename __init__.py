@@ -1,9 +1,9 @@
 bl_info = {
-    "name": "Link Editor",
+    "name": "Link Manager",
     "author": "Your Name",
     "version": (1, 0),
     "blender": (4, 2, 0),
-    "location": "View3D > Sidebar > Link Editor",
+    "location": "View3D > Sidebar > Link Manager",
     "description": "List linked files with expand toggle, relocate, reload, delete and add link buttons",
     "category": "Object",
 }
