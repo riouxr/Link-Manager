@@ -169,6 +169,21 @@ def load_highres_hidden(lo_fp):
         return True
     return False
 
+@persistent
+def linkeditor_load_post(dummy):
+    """
+    Clear all cached link-editor state when a new .blend is loaded,
+    so the panel shows only the current file’s libraries.
+    """
+    library_order.clear()
+    expanded_states.clear()
+    link_active_states.clear()
+    linked_elements.clear()
+    resolution_status.clear()
+    ephemerally_loaded_libraries.clear()
+    ephemeral_hidden_libraries.clear()
+    _RENDER_SWAPS.clear()
+
 # ────────────────────────────────────────────────────────────────────
 #  Render‑time swapping                                              
 # ────────────────────────────────────────────────────────────────────
@@ -259,31 +274,52 @@ class LINKEDITOR_OT_render_resolution(bpy.types.Operator):
 
 
 class LINKEDITOR_OT_load_and_unload(bpy.types.Operator):
+    """Unload a library if it’s loaded, or re-link it if it was unloaded."""
     bl_idname = "linkeditor.load_and_unload"
     bl_label  = "Load/Unload Linked File"
+
     filepath: bpy.props.StringProperty()
+
     def execute(self, context):
         fp = normalize_filepath(self.filepath)
-        for lib in bpy.data.libraries:
-            if normalize_filepath(lib.filepath) == fp:
-                linked_elements[fp] = get_linked_item_names(lib)
-                bpy.data.libraries.remove(lib)
-                link_active_states[fp] = False
-                break
-        else:
-            if fp in linked_elements:
-                with bpy.data.libraries.load(fp, link=True) as (src, dst):
-                    for dt, names in linked_elements[fp].items():
-                        setattr(dst, dt, [e for e in getattr(src, dt) if e in names])
-                col = context.view_layer.active_layer_collection.collection
-                for obj in dst.objects:
-                    if obj.name not in col.objects:
-                        col.objects.link(obj)
-                for c in dst.collections:
-                    if c.name not in col.children:
-                        col.children.link(c)
-                link_active_states[fp] = True
-        return {'FINISHED'}
+
+        # 1) Try to *find* the lib, in which case we unload it.
+        lib = next(
+            (l for l in bpy.data.libraries
+             if normalize_filepath(l.filepath) == fp),
+            None
+        )
+        if lib:
+            # capture its items so we can put them back later
+            linked_elements[fp] = get_linked_item_names(lib)
+
+            # remove the library from bpy.data
+            bpy.data.libraries.remove(lib)
+            link_active_states[fp] = False
+            return {'FINISHED'}
+
+        # 2) If it wasn’t in bpy.data.libraries, see if we have a cache to reload
+        if fp in linked_elements:
+            with bpy.data.libraries.load(fp, link=True) as (src, dst):
+                for dt, names in linked_elements[fp].items():
+                    setattr(dst, dt, [e for e in getattr(src, dt) if e in names])
+
+            # link the newly loaded objects/collections into the active layer
+            active_col = context.view_layer.active_layer_collection.collection
+            for obj in dst.objects:
+                if obj.name not in active_col.objects:
+                    active_col.objects.link(obj)
+            for coll in dst.collections:
+                if coll.name not in active_col.children:
+                    active_col.children.link(coll)
+
+            link_active_states[fp] = True
+            return {'FINISHED'}
+
+        # 3) Otherwise, nothing to do
+        self.report({'WARNING'}, "No library to unload or reload")
+        return {'CANCELLED'}
+
 
 class LINKEDITOR_OT_relocate(bpy.types.Operator, ImportHelper):
     bl_idname = "linkeditor.relocate"
@@ -300,23 +336,56 @@ class LINKEDITOR_OT_relocate(bpy.types.Operator, ImportHelper):
         return {'FINISHED'}
 
 class LINKEDITOR_OT_reload(bpy.types.Operator):
+    """Reload a linked .blend, preserving only the previously visible items."""
     bl_idname = "linkeditor.reload"
     bl_label  = "Reload Linked File"
+
     filepath: bpy.props.StringProperty()
+
     def execute(self, context):
         fp = normalize_filepath(self.filepath)
-        for lib in bpy.data.libraries:
-            if normalize_filepath(lib.filepath) == fp:
+
+        # 1) If the Library is currently loaded, capture its items and remove it
+        lib = next(
+            (l for l in bpy.data.libraries
+             if normalize_filepath(l.filepath) == fp),
+            None
+        )
+        if lib:
+            # cache the names of everything linked from that .blend
+            linked_elements[fp] = get_linked_item_names(lib)
+            try:
                 bpy.data.libraries.remove(lib)
-                with bpy.data.libraries.load(fp, link=True) as (src, dst):
-                    for dt, names in linked_elements.get(fp, {}).items():
-                        setattr(dst, dt, [e for e in getattr(src, dt) if e in names])
-                col = context.view_layer.active_layer_collection.collection
-                for o in dst.objects:
-                    if o.name not in col.objects:
-                        col.objects.link(o)
-                link_active_states[fp] = True
-                break
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to unload before reload: {e}")
+                return {'CANCELLED'}
+
+        # 2) Now we should have a cache of names
+        items = linked_elements.get(fp)
+        if not items:
+            self.report({'WARNING'}, "No items found to reload")
+            return {'CANCELLED'}
+
+        # 3) Load only those same names from disk
+        try:
+            with bpy.data.libraries.load(fp, link=True) as (src, dst):
+                for dt, names in items.items():
+                    setattr(dst, dt, [e for e in getattr(src, dt) if e in names])
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to reload library: {e}")
+            return {'CANCELLED'}
+
+        # 4) Link them back into the active view layer
+        active_col = context.view_layer.active_layer_collection.collection
+        for obj in dst.objects:
+            if obj.name not in active_col.objects:
+                active_col.objects.link(obj)
+        for coll in dst.collections:
+            if coll.name not in active_col.children:
+                active_col.children.link(coll)
+
+        link_active_states[fp] = True
+        self.report({'INFO'}, f"Reloaded: {os.path.basename(fp)}")
         return {'FINISHED'}
 
 class LINKEDITOR_OT_remove(bpy.types.Operator):
@@ -329,42 +398,46 @@ class LINKEDITOR_OT_remove(bpy.types.Operator):
     def execute(self, context):
         fp = normalize_filepath(self.filepath)
 
-        # build the alternate path for the other resolution
-        alt_fp = (
-            fp[:-len(lo_suffix())] + ".blend" if is_lo_file(fp)
-            else fp[:-6] + lo_suffix()
-        )
+        # Figure out which is low and which is high
+        if is_lo_file(fp):
+            lo_fp = fp
+            hi_fp = fp[:-len(lo_suffix())] + ".blend"
+        else:
+            hi_fp = fp
+            lo_fp = fp[:-6] + lo_suffix()
 
-        # find whichever Library datablock is currently loaded
+        # Candidates for removal
+        targets = {lo_fp, hi_fp}
+
+        # 1) Look for the library in bpy.data.libraries
         lib = next(
             (l for l in bpy.data.libraries
-             if normalize_filepath(l.filepath) in {fp, alt_fp}),
+             if normalize_filepath(l.filepath) in targets),
             None
         )
         if not lib:
             self.report({'WARNING'}, "Library not found")
             return {'CANCELLED'}
 
-        # capture the name *before* removing, to avoid ReferenceError
-        try:
-            name = os.path.basename(normalize_filepath(lib.filepath))
-        except Exception:
-            name = "Unknown"
+        # Capture its display name before removal
+        name = os.path.basename(normalize_filepath(lib.filepath))
 
+        # Remove it
         try:
             bpy.data.libraries.remove(lib)
         except RuntimeError as e:
             self.report({'ERROR'}, f"Could not delete library: {e}")
             return {'CANCELLED'}
 
-        # clean caches for both hi- and lo-res keys
-        for k in (fp, alt_fp):
-            link_active_states.pop(k, None)
-            linked_elements .pop(k, None)
-            resolution_status.pop(k, None)
+        # 2) Clean up any cached state for both hi- and lo-res keys
+        for key in targets:
+            link_active_states.pop(key,    None)
+            linked_elements .pop(key,    None)
+            resolution_status.pop(key,    None)
 
         self.report({'INFO'}, f"Deleted: {name}")
         return {'FINISHED'}
+
 
 
 class LINKEDITOR_OT_toggle_expand(bpy.types.Operator):
@@ -577,6 +650,8 @@ def register():
         description = "Suffix (no .blend) for low-res files",
         default     = "_Lo",
     )
+    if linkeditor_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(linkeditor_load_post)
     if prepare_render not in bpy.app.handlers.render_pre:
         bpy.app.handlers.render_pre.append(prepare_render)
     if restore_render not in bpy.app.handlers.render_post:
@@ -589,6 +664,8 @@ def unregister():
     bpy.utils.unregister_class(LinkEditorPreferences)
     # remove it from WM
     del bpy.types.WindowManager.linkeditor_lo_suffix
+    if linkeditor_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(linkeditor_load_post)
 
     for h in ("render_pre", "render_post", "render_cancel"):
         lst = getattr(bpy.app.handlers, h)
