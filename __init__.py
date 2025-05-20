@@ -12,23 +12,21 @@ import bpy
 import os
 from bpy.app.handlers import persistent
 from bpy_extras.io_utils import ImportHelper
+from bpy.props import StringProperty
 
-# ────────────────────────────────────────────────────────────────────
-#  Globals
-# ────────────────────────────────────────────────────────────────────
+# ### Globals
 library_order = []
 expanded_states = {}
 link_active_states = {}
-linked_elements = {} 
+linked_elements = {}
 resolution_status = {}
 ephemerally_loaded_libraries = set()
 ephemeral_hidden_libraries = set()
 _RENDER_SWAPS = {}
 LO_SUFFIX = "_Lo.blend"
 
-# ────────────────────────────────────────────────────────────────────
-#  Helpers
-# ────────────────────────────────────────────────────────────────────
+    
+# ### Helpers
 def normalize_filepath(filepath):
     """Return Blender-style forward-slash path (relative if prefs allow)."""
     abs_path = bpy.path.abspath(filepath)
@@ -48,15 +46,17 @@ def safe_library(id_block):
         return None
 
 def force_viewport_refresh():
-    """Redraw every 3D viewport in every Blender window."""
+    """Redraw every 3D viewport and update view layer in every Blender window."""
     bpy.context.view_layer.update()
-    wm = bpy.context.window_manager
-    if not wm:
-        return
-    for win in wm.windows:
-        for area in win.screen.areas:
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
             if area.type == 'VIEW_3D':
-                area.tag_redraw()
+                for region in area.regions:
+                    if region.type == 'WINDOW':
+                        region.tag_redraw()
 
 def reload_library(lib):
     """Version-safe wrapper for Library.reload()."""
@@ -65,7 +65,7 @@ def reload_library(lib):
     except RuntimeError:
         lib.reload()  # Fallback for Blender 4.2
 
-# ────────────────── Dynamic low/high-res helpers ─────────────────
+# #### Dynamic Low/High-Res Helpers
 def is_lo_file(path: str) -> bool:
     """True if path ends with the low-res suffix."""
     return normalize_filepath(path).endswith(LO_SUFFIX)
@@ -82,9 +82,7 @@ def lib_base(path: str) -> str:
         return p[:-len(LO_SUFFIX)]
     return p[:-6] if p.lower().endswith(".blend") else p
 
-# ────────────────────────────────────────────────────────────────────
-#  Linked-item capture
-# ────────────────────────────────────────────────────────────────────
+# ### Linked-Item Capture
 def get_linked_item_names(library):
     try:
         lib_fp_norm = normalize_filepath(library.filepath)
@@ -93,11 +91,10 @@ def get_linked_item_names(library):
 
     result = {}
     collections = []
-    collection_instances = []
+    collection_instances = {}  # Dictionary to map collection names to empty names
     objects = []
-    transforms = {}  # Store transforms for each collection's instance empty
+    transforms = {}
 
-    # Infer linking options
     abs_fp = bpy.path.abspath(library.filepath)
     is_relative = False
     if bpy.context.preferences.filepaths.use_relative_paths:
@@ -114,38 +111,38 @@ def get_linked_item_names(library):
         "instance_object_data": False
     }
 
-    # Check for linked collections and their linking method
     active_col = bpy.context.view_layer.active_layer_collection.collection
     for coll in bpy.data.collections:
         lib = safe_library(coll)
         if lib and normalize_filepath(lib.filepath) == lib_fp_norm:
             collections.append(coll.name)
-            if coll.name in [c.name for c in active_col.children]:
-                options["instance_collections"] = False
-            for obj in active_col.objects:
+            is_instanced = False
+            for obj in bpy.data.objects:
                 if obj.type == 'EMPTY' and obj.instance_collection == coll:
-                    collection_instances.append(obj.name)
-                    options["instance_collections"] = True
-                    # Store transforms of the instance empty
-                    obj.rotation_mode = 'QUATERNION'  # Ensure quaternion mode
+                    empty_name = obj.name if obj.name and obj.name != "Collection_Instances" else coll.name
+                    collection_instances[coll.name] = empty_name
+                    is_instanced = True
+                    obj.rotation_mode = 'QUATERNION'
                     transforms[coll.name] = {
                         'location': list(obj.location),
                         'rotation': list(obj.rotation_quaternion),
                         'scale': list(obj.scale)
                     }
                     break
+            options["instance_collections"] = is_instanced
+            if not is_instanced and coll.name in [c.name for c in active_col.children]:
+                options["instance_collections"] = False
 
-    # Check for objects, including those in collections, and their data
     for obj in bpy.data.objects:
         lib = safe_library(obj)
         if lib and normalize_filepath(lib.filepath) == lib_fp_norm:
             if obj.type == 'EMPTY' and obj.instance_collection:
                 if obj.instance_collection.name not in collections:
                     collections.append(obj.instance_collection.name)
-                if obj.name not in collection_instances:
-                    collection_instances.append(obj.name)
+                if obj.instance_collection.name not in collection_instances:
+                    collection_instances[obj.instance_collection.name] = obj.name
                 options["instance_collections"] = True
-                obj.rotation_mode = 'QUATERNION'  # Ensure quaternion mode
+                obj.rotation_mode = 'QUATERNION'
                 transforms[obj.instance_collection.name] = {
                     'location': list(obj.location),
                     'rotation': list(obj.rotation_quaternion),
@@ -153,7 +150,7 @@ def get_linked_item_names(library):
                 }
             else:
                 obj_collection_names = [c.name for c in obj.users_collection]
-                if obj.name not in collection_instances and (obj.name in [o.name for o in active_col.objects] or any(c in collections for c in obj_collection_names)):
+                if obj.name not in collection_instances.values() and (obj.name in [o.name for o in active_col.objects] or any(c in collections for c in obj_collection_names)):
                     if obj.data and safe_library(obj.data) and normalize_filepath(obj.data.library.filepath) == lib_fp_norm:
                         options["instance_object_data"] = True
                         objects.append(obj.name)
@@ -188,9 +185,7 @@ def get_linked_item_names(library):
     result['options'] = options
     return result
 
-# ────────────────────────────────────────────────────────────────────
-#  Hi-res loader (hidden)
-# ────────────────────────────────────────────────────────────────────
+# ### Hi-Res Loader (Hidden)
 def load_highres_hidden(lo_fp):
     def base(name):
         for suf in ("_Lo", "_lo", "_Low", "_low"):
@@ -223,8 +218,7 @@ def load_highres_hidden(lo_fp):
     except Exception:
         return False
 
-    lib = next((l for l in bpy.data.libraries
-                if normalize_filepath(l.filepath) == hi_fp), None)
+    lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) == hi_fp), None)
     if lib:
         ephemerally_loaded_libraries.add(lib)
         ephemeral_hidden_libraries.add(hi_fp)
@@ -251,9 +245,7 @@ def monitor_libraries(dummy):
         if fp not in linked_elements:
             linked_elements[fp] = get_linked_item_names(lib)
 
-# ────────────────────────────────────────────────────────────────────
-#  Render-time swapping
-# ────────────────────────────────────────────────────────────────────
+# ### Render-Time Swapping
 @persistent
 def prepare_render(scene, _):
     for lo_fp, rs in resolution_status.items():
@@ -261,8 +253,7 @@ def prepare_render(scene, _):
             continue
         hi_fp = rs["high_path"]
         base = lib_base(lo_fp)
-        lib = next((l for l in bpy.data.libraries
-                    if lib_base(l.filepath) == base), None)
+        lib = next((l for l in bpy.data.libraries if lib_base(l.filepath) == base), None)
         if not lib or normalize_filepath(lib.filepath) == hi_fp:
             continue
         _RENDER_SWAPS[base] = lib.filepath
@@ -282,9 +273,7 @@ def restore_render(scene, _):
     bpy.context.view_layer.update()
     force_viewport_refresh()
 
-# ────────────────────────────────────────────────────────────────────
-#  Operators
-# ────────────────────────────────────────────────────────────────────
+# ### Operators
 class LINKEDITOR_OT_render_resolution(bpy.types.Operator):
     """Toggle whether this low-res library is swapped to Hi-res at render time."""
     bl_idname = "linkeditor.render_resolution"
@@ -313,21 +302,23 @@ class LINKEDITOR_OT_load_and_unload(bpy.types.Operator):
     """Unload a library if it’s loaded, or re-link it if it was unloaded."""
     bl_idname = "linkeditor.load_and_unload"
     bl_label = "Load/Unload Linked File"
-    filepath: bpy.props.StringProperty()
+    filepath: StringProperty()
 
     def execute(self, context):
         fp = normalize_filepath(self.filepath)
         lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) == fp), None)
+
+        # --- Unload existing library ---
         if lib:
             linked_elements[fp] = get_linked_item_names(lib)
             if linked_elements[fp].get('type') == 'collections':
                 active_col = context.view_layer.active_layer_collection.collection
-                collections = linked_elements[fp].get('collections', [])
-                for obj in active_col.objects[:]:
-                    if obj.type == 'EMPTY':
+                collections = linked_elements[fp]['collections']
+                for obj in list(active_col.objects):
+                    if obj.type == 'EMPTY' and obj.instance_collection:
                         coll = obj.instance_collection
-                        if (coll and coll.name in collections and safe_library(coll) and normalize_filepath(coll.library.filepath) == fp) or \
-                           (not safe_library(obj) and (obj.name in collections or '_instance' in obj.name)):
+                        coll_lib = safe_library(coll)
+                        if coll_lib and normalize_filepath(coll_lib.filepath) == fp and coll.name in collections:
                             bpy.data.objects.remove(obj, do_unlink=True)
             bpy.data.libraries.remove(lib)
             link_active_states[fp] = False
@@ -335,95 +326,55 @@ class LINKEDITOR_OT_load_and_unload(bpy.types.Operator):
             self.report({'INFO'}, f"Unloaded: {os.path.basename(fp)}")
             return {'FINISHED'}
 
-        if fp in linked_elements:
-            options = linked_elements[fp].get('options', {
-                'relative_path': False,
-                'active_collection': True,
-                'instance_collections': bool(linked_elements[fp].get('collection_instances', [])),
-                'instance_object_data': False
-            }).copy()
+        # --- Reload library if previously known ---
+        elif fp in linked_elements:
+            options = linked_elements[fp].get('options', {}).copy()
             transforms = linked_elements[fp].get('transforms', {})
+            previous_instances = linked_elements[fp].get('collection_instances', {})
 
-            try:
-                with bpy.data.libraries.load(fp, link=True) as (src, dst):
-                    for dt, names in linked_elements[fp].items():
-                        if dt not in ('options', 'collection_instances', 'type', 'transforms'):
-                            setattr(dst, dt, [e for e in getattr(src, dt) if e in names])
-            except Exception as e:
-                self.report({'ERROR'}, f"Failed to reload library: {e}")
-                return {'CANCELLED'}
+            with bpy.data.libraries.load(fp, link=True) as (src, dst):
+                for dt, names in linked_elements[fp].items():
+                    if dt not in ('options', 'collection_instances', 'type', 'transforms'):
+                        setattr(dst, dt, [e for e in getattr(src, dt) if e in names])
 
-            datablock_type = linked_elements[fp].get('type', 'objects')
             active_col = context.view_layer.active_layer_collection.collection
-
-            def get_all_collections_with(coll_name):
-                result = []
-                def check_collection(col, path):
-                    if coll_name in [c.name for c in col.children]:
-                        result.append(f"{path}/{col.name}")
-                    for child in col.children:
-                        check_collection(child, f"{path}/{col.name}")
-                check_collection(bpy.context.scene.collection, "Scene Collection")
-                return result
-
-            for obj in active_col.objects[:]:
-                if obj.type == 'EMPTY':
-                    lib = safe_library(obj)
-                    if (lib and normalize_filepath(lib.filepath) == fp) or \
-                       (obj.instance_collection and not bpy.data.collections.get(obj.instance_collection.name)) or \
-                       (not lib and '_instance' in obj.name):
+            # remove old empties
+            for obj in list(active_col.objects):
+                if obj.type == 'EMPTY' and obj.instance_collection:
+                    coll = obj.instance_collection
+                    if safe_library(coll) and normalize_filepath(coll.library.filepath) == fp:
                         bpy.data.objects.remove(obj, do_unlink=True)
 
-            if datablock_type == 'collections':
-                collections = linked_elements[fp].get('collections', [])
-                linked_elements[fp]['collection_instances'] = []
-
-                def unlink_collection(coll_name):
-                    def process_collection(col):
-                        for child in col.children[:]:
-                            if child.name == coll_name and safe_library(child) and normalize_filepath(child.library.filepath) == fp:
-                                col.children.unlink(child)
-                            process_collection(child)
-                    process_collection(bpy.context.scene.collection)
-                for coll_name in collections:
-                    unlink_collection(coll_name)
-
-                for coll_name in collections:
-                    coll = bpy.data.collections.get(coll_name)
+            if linked_elements[fp]['type'] == 'collections':
+                for coll_name in linked_elements[fp]['collections']:
+                    coll = next((c for c in bpy.data.collections if c.name == coll_name
+                                 and safe_library(c)
+                                 and normalize_filepath(c.library.filepath) == fp), None)
                     if not coll:
                         continue
-                    if options['instance_collections']:
-                        instance_names = linked_elements[fp].get('collection_instances', [])
-                        empty_name = instance_names[0] if instance_names else f"{coll_name}_instance"
+                    if options.get('instance_collections'):
+                        empty_name = previous_instances.get(coll_name) or f"{coll_name}_instance"
+                        count = 1
+                        while empty_name in bpy.data.objects:
+                            empty_name = f"{coll_name}_instance.{count:03d}"
+                            count += 1
                         empty = bpy.data.objects.new(name=empty_name, object_data=None)
                         empty.instance_type = 'COLLECTION'
                         empty.instance_collection = coll
-                        empty.rotation_mode = 'QUATERNION'  # Ensure quaternion mode
-                        if empty.name not in [o.name for o in active_col.objects]:
-                            active_col.objects.link(empty)
-                        # Apply stored transforms if available
-                        if coll_name in transforms:
-                            empty.location = transforms[coll_name].get('location', [0, 0, 0])
-                            empty.rotation_quaternion = transforms[coll_name].get('rotation', [1, 0, 0, 0])
-                            empty.scale = transforms[coll_name].get('scale', [1, 1, 1])
-                        linked_elements[fp]['collection_instances'].append(empty.name)
-                    else:
-                        if coll.name not in [c.name for c in active_col.children]:
-                            active_col.children.link(coll)
-
+                        empty.rotation_mode = 'QUATERNION'
+                        active_col.objects.link(empty)
+                        tr = transforms.get(coll_name, {})
+                        empty.location = tr.get('location', (0,0,0))
+                        empty.rotation_quaternion = tr.get('rotation', (1,0,0,0))
+                        empty.scale = tr.get('scale', (1,1,1))
             else:
-                valid_objects = linked_elements[fp].get('objects', [])
-                for obj in dst.objects:
-                    if obj and obj.name in valid_objects and obj.type != 'EMPTY':
-                        obj.parent = None
+                for obj_name in linked_elements[fp].get('objects', []):
+                    obj = bpy.data.objects.get(obj_name)
+                    if obj and safe_library(obj) and normalize_filepath(obj.library.filepath) == fp:
                         active_col.objects.link(obj)
 
-            for obj in active_col.objects[:]:
-                if obj.type == 'EMPTY' and obj.name not in linked_elements[fp].get('collection_instances', []):
-                    bpy.data.objects.remove(obj, do_unlink=True)
-
             lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) == fp), None)
-            if lib and options['relative_path']:
+            if lib and options.get('relative_path'):
                 try:
                     lib.filepath = bpy.path.relpath(bpy.path.abspath(fp))
                 except ValueError:
@@ -437,124 +388,68 @@ class LINKEDITOR_OT_load_and_unload(bpy.types.Operator):
         self.report({'WARNING'}, "No library to unload or reload")
         return {'CANCELLED'}
 
+
+# -------------------------------------------------
+# Operator: Reload
+# -------------------------------------------------
 class LINKEDITOR_OT_reload(bpy.types.Operator):
     """Reload a linked .blend, preserving only the previously visible items."""
     bl_idname = "linkeditor.reload"
     bl_label = "Reload Linked File"
-    filepath: bpy.props.StringProperty()
+    filepath: StringProperty()
 
     def execute(self, context):
         fp = normalize_filepath(self.filepath)
         lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) == fp), None)
+
+        # unload if loaded
         if lib:
             linked_elements[fp] = get_linked_item_names(lib)
-            if linked_elements[fp].get('type') == 'collections':
+            if linked_elements[fp]['type'] == 'collections':
                 active_col = context.view_layer.active_layer_collection.collection
-                collections = linked_elements[fp].get('collections', [])
-                for obj in active_col.objects[:]:
-                    if obj.type == 'EMPTY':
+                collections = linked_elements[fp]['collections']
+                for obj in list(active_col.objects):
+                    if obj.type == 'EMPTY' and obj.instance_collection:
                         coll = obj.instance_collection
-                        if (coll and coll.name in collections and safe_library(coll) and normalize_filepath(coll.library.filepath) == fp) or \
-                           (not safe_library(obj) and (obj.name in collections or '_instance' in obj.name)):
+                        if normalize_filepath(coll.library.filepath) == fp and coll.name in collections:
                             bpy.data.objects.remove(obj, do_unlink=True)
-            try:
-                bpy.data.libraries.remove(lib)
-            except Exception as e:
-                self.report({'ERROR'}, f"Failed to unload before reload: {e}")
-                return {'CANCELLED'}
+            bpy.data.libraries.remove(lib)
 
         items = linked_elements.get(fp)
         if not items:
             self.report({'WARNING'}, "No items found to reload")
             return {'CANCELLED'}
 
-        options = items.get('options', {
-            'relative_path': False,
-            'active_collection': True,
-            'instance_collections': bool(items.get('collection_instances', [])),
-            'instance_object_data': False
-        }).copy()
-        transforms = items.get('transforms', {})
+        with bpy.data.libraries.load(fp, link=True) as (src, dst):
+            for dt, names in items.items():
+                if dt in ('options', 'collection_instances', 'type', 'transforms'):
+                    continue
+                setattr(dst, dt, [n for n in names if n in getattr(src, dt, [])])
 
-        try:
-            with bpy.data.libraries.load(fp, link=True) as (src, dst):
-                for dt, names in items.items():
-                    if dt not in ('options', 'collection_instances', 'type', 'transforms'):
-                        setattr(dst, dt, [e for e in getattr(src, dt) if e in names])
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to reload library: {e}")
-            return {'CANCELLED'}
-
-        datablock_type = items.get('type', 'objects')
         active_col = context.view_layer.active_layer_collection.collection
-
-        def get_all_collections_with(coll_name):
-            result = []
-            def check_collection(col, path):
-                if coll_name in [c.name for c in col.children]:
-                    result.append(f"{path}/{col.name}")
-                for child in col.children:
-                    check_collection(child, f"{path}/{col.name}")
-            check_collection(bpy.context.scene.collection, "Scene Collection")
-            return result
-
-        for obj in active_col.objects[:]:
-            if obj.type == 'EMPTY':
-                lib = safe_library(obj)
-                if (lib and normalize_filepath(lib.filepath) == fp) or \
-                   (obj.instance_collection and not bpy.data.collections.get(obj.instance_collection.name)) or \
-                   (not lib and '_instance' in obj.name):
-                    bpy.data.objects.remove(obj, do_unlink=True)
-
-        if datablock_type == 'collections':
-            collections = items.get('collections', [])
-            items['collection_instances'] = []
-
-            def unlink_collection(coll_name):
-                def process_collection(col):
-                    for child in col.children[:]:
-                        if child.name == coll_name and safe_library(child) and normalize_filepath(child.library.filepath) == fp:
-                            col.children.unlink(child)
-                        process_collection(child)
-                process_collection(bpy.context.scene.collection)
-            for coll_name in collections:
-                unlink_collection(coll_name)
-
-            for coll_name in collections:
-                coll = bpy.data.collections.get(coll_name)
+        if items['type'] == 'collections':
+            for coll_name, empty_name in items['collection_instances'].items():
+                coll = next((c for c in bpy.data.collections if c.name == coll_name
+                             and safe_library(c)
+                             and normalize_filepath(c.library.filepath) == fp), None)
                 if not coll:
                     continue
-                if options['instance_collections']:
-                    instance_names = items.get('collection_instances', [])
-                    empty_name = instance_names[0] if instance_names else f"{coll_name}_instance"
-                    empty = bpy.data.objects.new(name=empty_name, object_data=None)
-                    empty.instance_type = 'COLLECTION'
-                    empty.instance_collection = coll
-                    empty.rotation_mode = 'QUATERNION'  # Ensure quaternion mode
-                    if empty.name not in [o.name for o in active_col.objects]:
-                        active_col.objects.link(empty)
-                    if coll_name in transforms:
-                        empty.location = transforms[coll_name].get('location', [0, 0, 0])
-                        empty.rotation_quaternion = transforms[coll_name].get('rotation', [1, 0, 0, 0])
-                        empty.scale = transforms[coll_name].get('scale', [1, 1, 1])
-                    items['collection_instances'].append(empty.name)
-                else:
-                    if coll.name not in [c.name for c in active_col.children]:
-                        active_col.children.link(coll)
-
+                empty = bpy.data.objects.new(name=empty_name, object_data=None)
+                empty.instance_type = 'COLLECTION'
+                empty.instance_collection = coll
+                empty.rotation_mode = 'QUATERNION'
+                active_col.objects.link(empty)
+                tr = items['transforms'].get(coll_name, {})
+                empty.location = tr.get('location', (0,0,0))
+                empty.rotation_quaternion = tr.get('rotation', (1,0,0,0))
+                empty.scale = tr.get('scale', (1,1,1))
         else:
-            valid_objects = items.get('objects', [])
-            for obj in dst.objects:
-                if obj and obj.name in valid_objects and obj.type != 'EMPTY':
-                    obj.parent = None
+            for obj_name in items.get('objects', []):
+                obj = bpy.data.objects.get(obj_name)
+                if obj and safe_library(obj) and normalize_filepath(obj.library.filepath) == fp:
                     active_col.objects.link(obj)
 
-        for obj in active_col.objects[:]:
-            if obj.type == 'EMPTY' and obj.name not in items.get('collection_instances', []):
-                bpy.data.objects.remove(obj, do_unlink=True)
-
-        lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) == fp), None)
-        if lib and options['relative_path']:
+        if lib and items.get('options', {}).get('relative_path'):
             try:
                 lib.filepath = bpy.path.relpath(bpy.path.abspath(fp))
             except ValueError:
@@ -564,8 +459,13 @@ class LINKEDITOR_OT_reload(bpy.types.Operator):
         force_viewport_refresh()
         self.report({'INFO'}, f"Reloaded: {os.path.basename(fp)}")
         return {'FINISHED'}
+# -------------------------------------------------
+# Operator: Remove
+# -------------------------------------------------
+
     
 class LINKEDITOR_OT_relocate(bpy.types.Operator, ImportHelper):
+    """Relocate a linked .blend file to a new filepath."""
     bl_idname = "linkeditor.relocate"
     bl_label = "Relocate Linked File"
     filter_glob: bpy.props.StringProperty(default="*.blend", options={'HIDDEN'})
@@ -580,53 +480,86 @@ class LINKEDITOR_OT_relocate(bpy.types.Operator, ImportHelper):
                 break
         return {'FINISHED'}
 
-
 class LINKEDITOR_OT_remove(bpy.types.Operator):
-    """Delete a linked .blend (both hi- and lo-res variants if present)."""
+    """Delete a linked .blend (handles hi- and lo-res) and re-link collections from other active libraries."""
     bl_idname = "linkeditor.remove"
     bl_label = "Delete Linked File"
-    filepath: bpy.props.StringProperty()
+    filepath: StringProperty()
 
     def execute(self, context):
         fp = normalize_filepath(self.filepath)
+        # determine low/high paths
         if is_lo_file(fp):
-            lo_fp = fp
-            hi_fp = fp[:-len(LO_SUFFIX)] + ".blend"
+            lo_fp, hi_fp = fp, fp[:-len(LO_SUFFIX)] + ".blend"
         else:
-            hi_fp = fp
-            lo_fp = fp[:-6] + LO_SUFFIX
-
+            hi_fp, lo_fp = fp, fp[:-6] + LO_SUFFIX
         targets = {lo_fp, hi_fp}
         lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) in targets), None)
         if not lib:
             self.report({'WARNING'}, "Library not found")
             return {'CANCELLED'}
-
         name = os.path.basename(normalize_filepath(lib.filepath))
 
-        # Remove instance empties for collections
+        active_col = context.view_layer.active_layer_collection.collection
+        # remove empties only from this file
         if fp in linked_elements and 'collections' in linked_elements[fp]:
-            collections = linked_elements[fp]['collections']
-            for obj in bpy.data.objects:
-                if obj.type == 'EMPTY' and obj.instance_collection and obj.instance_collection.name in collections:
-                    bpy.data.objects.remove(obj, do_unlink=True)
-
+            for obj in list(active_col.objects):
+                if obj.type == 'EMPTY' and obj.instance_collection:
+                    coll = obj.instance_collection
+                    coll_lib = safe_library(coll)
+                    if coll_lib and normalize_filepath(coll_lib.filepath) == fp and coll.name in linked_elements[fp]['collections']:
+                        bpy.data.objects.remove(obj, do_unlink=True)
+        # remove the library data
         try:
             bpy.data.libraries.remove(lib)
         except RuntimeError as e:
             self.report({'ERROR'}, f"Could not delete library: {e}")
             return {'CANCELLED'}
 
-        for key in targets:
-            link_active_states.pop(key, None)
-            linked_elements.pop(key, None)
-            resolution_status.pop(key, None)
+        # cleanup internal state
+        link_active_states.pop(lo_fp, None)
+        link_active_states.pop(hi_fp, None)
+        linked_elements.pop(lo_fp, None)
+        linked_elements.pop(hi_fp, None)
+        resolution_status.pop(lo_fp, None)
+        resolution_status.pop(hi_fp, None)
+
+        # re-link collections for other active libraries to restore their empties
+        for other_fp, active in list(link_active_states.items()):
+            if not active:
+                continue
+            info = linked_elements.get(other_fp)
+            if not info or info.get('type') != 'collections':
+                continue
+            for coll_name in info['collections']:
+                # find the right collection by filepath
+                coll = next((c for c in bpy.data.collections
+                             if c.name == coll_name
+                             and safe_library(c)
+                             and normalize_filepath(c.library.filepath) == other_fp), None)
+                if not coll:
+                    continue
+                # check if empty already exists
+                exists = any(o for o in active_col.objects
+                             if o.type=='EMPTY' and o.instance_collection==coll)
+                if not exists:
+                    empty = bpy.data.objects.new(name=f"{coll_name}_instance", object_data=None)
+                    empty.instance_type = 'COLLECTION'
+                    empty.instance_collection = coll
+                    empty.rotation_mode = 'QUATERNION'
+                    active_col.objects.link(empty)
+                    # restore transform if known
+                    tr = info.get('transforms', {}).get(coll_name, {})
+                    empty.location = tr.get('location', (0,0,0))
+                    empty.rotation_quaternion = tr.get('rotation', (1,0,0,0))
+                    empty.scale = tr.get('scale', (1,1,1))
 
         self.report({'INFO'}, f"Deleted: {name}")
         force_viewport_refresh()
         return {'FINISHED'}
 
 class LINKEDITOR_OT_toggle_expand(bpy.types.Operator):
+    """Toggle the expanded state of a library in the UI."""
     bl_idname = "linkeditor.toggle_expand"
     bl_label = "Toggle Expand"
     filepath: bpy.props.StringProperty()
@@ -658,6 +591,13 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
         hi_fp = get_hi_res_path(normalize_filepath(self.original_filepath))
         lo_fp = hi_fp[:-6] + LO_SUFFIX
         tgt = normalize_filepath(self.filepath)
+
+        # Check if the library is unloaded
+        orig_norm = normalize_filepath(self.original_filepath)
+        if orig_norm in link_active_states and not link_active_states[orig_norm]:
+            self.report({'WARNING'}, "Turn visibility ON for switching resolution")
+            return {'CANCELLED'}
+
         lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) in {hi_fp, lo_fp}), None)
         if not lib:
             self.report({'ERROR'}, "Linked library not found")
@@ -673,7 +613,6 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
                 ephemerally_loaded_libraries.discard(hid)
             ephemeral_hidden_libraries.discard(hi_fp)
 
-        # Store transforms from current library before switching
         current_fp = normalize_filepath(lib.filepath)
         linked_elements[current_fp] = get_linked_item_names(lib)
         transforms = linked_elements[current_fp].get('transforms', {})
@@ -689,7 +628,6 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
             if coll.library == lib and coll.name not in col.children:
                 col.children.link(coll)
 
-        # Apply stored transforms to matching collections in the new library
         tgt_fp = normalize_filepath(tgt)
         linked_elements[tgt_fp] = get_linked_item_names(lib)
         if linked_elements[tgt_fp].get('type') == 'collections':
@@ -697,7 +635,7 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
                 if coll_name in transforms:
                     for obj in col.objects:
                         if obj.type == 'EMPTY' and obj.instance_collection and obj.instance_collection.name == coll_name:
-                            obj.rotation_mode = 'QUATERNION'  # Ensure quaternion mode
+                            obj.rotation_mode = 'QUATERNION'
                             obj.location = transforms[coll_name].get('location', [0, 0, 0])
                             obj.rotation_quaternion = transforms[coll_name].get('rotation', [1, 0, 0, 0])
                             obj.scale = transforms[coll_name].get('scale', [1, 1, 1])
@@ -706,20 +644,18 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
         rs = resolution_status.setdefault(hi_fp, {"high_path": hi_fp, "low_path": lo_fp})
         rs["status"] = "high" if tgt == hi_fp else "low"
 
-        for hlib in list(ephemerally_loaded_libraries):
-            if normalize_filepath(hlib.filepath) == hi_fp and hlib is not lib:
-                try:
-                    bpy.data.libraries.remove(hlib)
-                except RuntimeError:
-                    pass
-                ephemerally_loaded_libraries.discard(hlib)
-                ephemeral_hidden_libraries.discard(hi_fp)
+        tgt_norm = normalize_filepath(tgt)
+        if orig_norm in library_order:
+            idx = library_order.index(orig_norm)
+            library_order[idx] = tgt_norm
+
+        if orig_norm in link_active_states:
+            link_active_states[tgt_norm] = link_active_states.pop(orig_norm)
 
         force_viewport_refresh()
         return {'FINISHED'}
-# ────────────────────────────────────────────────────────────────────
-#  UI Panel
-# ────────────────────────────────────────────────────────────────────
+
+# ### UI Panel
 class LINKEDITOR_PT_panel(bpy.types.Panel):
     bl_label = "Link Manager"
     bl_idname = "LINKEDITOR_PT_panel"
@@ -734,24 +670,24 @@ class LINKEDITOR_PT_panel(bpy.types.Panel):
         layout.label(text="Linked Files:")
         current_norm = [normalize_filepath(l.filepath) for l in bpy.data.libraries]
         bases_in_scene = {base(fp) for fp in current_norm}
+        library_order[:] = [fp for fp in library_order if base(fp) in bases_in_scene or fp in link_active_states]
         for fp in current_norm:
-            if all(base(fp) != base(k) for k in library_order):
+            if base(fp) not in {base(k) for k in library_order}:
                 library_order.append(fp)
 
-        show = [fp for fp in library_order if base(fp) in bases_in_scene or fp in link_active_states]
-        for fp in show:
+        for fp in library_order:
             live_fp = next((c for c in current_norm if base(c) == base(fp)), fp)
             abs_fp = bpy.path.abspath(live_fp)
             if live_fp in ephemeral_hidden_libraries or resolution_status.get(live_fp, {}).get("hidden"):
                 continue
 
-            expanded = expanded_states.get(base(fp), False)
+            expanded = expanded_states.get(live_fp, False)
             row = layout.row(align=True)
             row.operator("linkeditor.toggle_expand", text="",
                          icon="TRIA_DOWN" if expanded else "TRIA_RIGHT",
-                         emboss=False).filepath = base(fp)
+                         emboss=False).filepath = live_fp
             row.label(text=os.path.basename(abs_fp))
-            is_loaded = link_active_states.get(base(fp), True)
+            is_loaded = link_active_states.get(live_fp, True)
             row.operator("linkeditor.load_and_unload", text="",
                          icon="HIDE_OFF" if is_loaded else "HIDE_ON").filepath = live_fp
             is_lo = is_lo_file(abs_fp)
@@ -772,9 +708,7 @@ class LINKEDITOR_PT_panel(bpy.types.Panel):
         layout.separator()
         layout.operator("wm.link", text="Add Link", icon="ADD")
 
-# ────────────────────────────────────────────────────────────────────
-#  Registration
-# ────────────────────────────────────────────────────────────────────
+# ### Registration
 classes = (
     LINKEDITOR_OT_toggle_expand,
     LINKEDITOR_OT_load_and_unload,
@@ -792,7 +726,6 @@ def register():
             bpy.utils.register_class(c)
         except ValueError:
             pass
-    # Clear all existing handlers to prevent conflicts
     for handler in bpy.app.handlers.load_post[:]:
         if handler.__name__ == 'linkeditor_load_post':
             bpy.app.handlers.load_post.remove(handler)
@@ -808,7 +741,6 @@ def register():
     for handler in bpy.app.handlers.depsgraph_update_post[:]:
         if handler.__name__ == 'monitor_libraries':
             bpy.app.handlers.depsgraph_update_post.remove(handler)
-    # Register new handlers
     bpy.app.handlers.load_post.append(linkeditor_load_post)
     bpy.app.handlers.render_pre.append(prepare_render)
     bpy.app.handlers.render_post.append(restore_render)
@@ -836,10 +768,10 @@ def unregister():
     for handler in bpy.app.handlers.depsgraph_update_post[:]:
         if handler.__name__ == 'monitor_libraries':
             bpy.app.handlers.depsgraph_update_post.remove(handler)
-            
+
 if __name__ == "__main__":
     try:
         unregister()
-    except Exception as e:
-        print(f"Error during unregister: {e}")
+    except Exception:
+        pass
     register()
