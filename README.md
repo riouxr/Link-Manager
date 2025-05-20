@@ -6,4 +6,4 @@ You can also switch the linked file for a low res version and you have the possi
 
 Please see the following link for more information:
 
-(To be added)
+https://youtu.be/VWrbbVzFlzE
