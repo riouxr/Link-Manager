@@ -48,15 +48,11 @@ def safe_library(id_block):
 def force_viewport_refresh():
     """Redraw every 3D viewport and update view layer in every Blender window."""
     bpy.context.view_layer.update()
-    for area in bpy.context.screen.areas:
-        if area.type == 'VIEW_3D':
-            area.tag_redraw()
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             if area.type == 'VIEW_3D':
                 for region in area.regions:
-                    if region.type == 'WINDOW':
-                        region.tag_redraw()
+                    region.tag_redraw()
 
 def reload_library(lib):
     """Version-safe wrapper for Library.reload()."""
@@ -248,15 +244,14 @@ def monitor_libraries(dummy):
 # ### Render-Time Swapping
 @persistent
 def prepare_render(scene, _):
-    for lo_fp, rs in resolution_status.items():
-        if not rs.get("high_res_for_render"):
+    for fp, rs in resolution_status.items():
+        if rs.get("status") != "low" or not rs.get("high_res_for_render"):
             continue
         hi_fp = rs["high_path"]
-        base = lib_base(lo_fp)
-        lib = next((l for l in bpy.data.libraries if lib_base(l.filepath) == base), None)
+        lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) == fp), None)
         if not lib or normalize_filepath(lib.filepath) == hi_fp:
             continue
-        _RENDER_SWAPS[base] = lib.filepath
+        _RENDER_SWAPS[id(lib)] = lib.filepath
         lib.filepath = hi_fp
         reload_library(lib)
     bpy.context.view_layer.update()
@@ -264,8 +259,7 @@ def prepare_render(scene, _):
 @persistent
 def restore_render(scene, _):
     for lib in bpy.data.libraries:
-        base = lib_base(lib.filepath)
-        orig_low = _RENDER_SWAPS.pop(base, None)
+        orig_low = _RENDER_SWAPS.pop(id(lib), None)
         if not orig_low or normalize_filepath(lib.filepath) == orig_low:
             continue
         lib.filepath = orig_low
@@ -282,8 +276,8 @@ class LINKEDITOR_OT_render_resolution(bpy.types.Operator):
 
     def execute(self, context):
         lo_fp = normalize_filepath(self.filepath)
-        if not is_lo_file(lo_fp):
-            self.report({'WARNING'}, f"Works only on *{LO_SUFFIX} files.")
+        if resolution_status.get(lo_fp, {}).get("status") != "low" and not is_lo_file(lo_fp):
+            self.report({'WARNING'}, f"Works only on low-res files.")
             return {'CANCELLED'}
         rs = resolution_status.setdefault(
             lo_fp, {
@@ -488,17 +482,11 @@ class LINKEDITOR_OT_remove(bpy.types.Operator):
 
     def execute(self, context):
         fp = normalize_filepath(self.filepath)
-        # determine low/high paths
-        if is_lo_file(fp):
-            lo_fp, hi_fp = fp, fp[:-len(LO_SUFFIX)] + ".blend"
-        else:
-            hi_fp, lo_fp = fp, fp[:-6] + LO_SUFFIX
-        targets = {lo_fp, hi_fp}
-        lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) in targets), None)
+        lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) == fp), None)
         if not lib:
             self.report({'WARNING'}, "Library not found")
             return {'CANCELLED'}
-        name = os.path.basename(normalize_filepath(lib.filepath))
+        name = os.path.basename(fp)
 
         active_col = context.view_layer.active_layer_collection.collection
         # remove empties only from this file
@@ -517,12 +505,24 @@ class LINKEDITOR_OT_remove(bpy.types.Operator):
             return {'CANCELLED'}
 
         # cleanup internal state
-        link_active_states.pop(lo_fp, None)
-        link_active_states.pop(hi_fp, None)
-        linked_elements.pop(lo_fp, None)
-        linked_elements.pop(hi_fp, None)
-        resolution_status.pop(lo_fp, None)
-        resolution_status.pop(hi_fp, None)
+        link_active_states.pop(fp, None)
+        linked_elements.pop(fp, None)
+        rs = resolution_status.pop(fp, None)
+        if rs:
+            other = rs["high_path"] if rs["status"] == "low" else rs["low_path"]
+            link_active_states.pop(other, None)
+            linked_elements.pop(other, None)
+            resolution_status.pop(other, None)
+        else:
+            # fallback to naming
+            if is_lo_file(fp):
+                other = get_hi_res_path(fp)
+            else:
+                other = fp[:-6] + LO_SUFFIX if fp.lower().endswith(".blend") else ""
+            if other:
+                link_active_states.pop(other, None)
+                linked_elements.pop(other, None)
+                resolution_status.pop(other, None)
 
         # re-link collections for other active libraries to restore their empties
         for other_fp, active in list(link_active_states.items()):
@@ -576,11 +576,15 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
     original_filepath: bpy.props.StringProperty()
     filter_glob: bpy.props.StringProperty(default="*.blend", options={'HIDDEN'})
 
-    def invoke(self, context, _):
+    def invoke(self, context, event):
         orig = normalize_filepath(self.original_filepath)
-        hi_fp = get_hi_res_path(orig)
-        lo_fp = hi_fp[:-6] + LO_SUFFIX
-        tgt = lo_fp if orig == hi_fp else hi_fp
+        rs = resolution_status.get(orig, {})
+        if rs:
+            tgt = rs["low_path"] if rs["status"] == "high" else rs["high_path"]
+        else:
+            hi_fp = get_hi_res_path(orig)
+            lo_fp = hi_fp[:-6] + LO_SUFFIX
+            tgt = lo_fp if orig == hi_fp else hi_fp
         if not os.path.exists(bpy.path.abspath(tgt)):
             context.window_manager.fileselect_add(self)
             return {'RUNNING_MODAL'}
@@ -588,16 +592,16 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
         return self.execute(context)
 
     def execute(self, context):
-        hi_fp = get_hi_res_path(normalize_filepath(self.original_filepath))
-        lo_fp = hi_fp[:-6] + LO_SUFFIX
-        tgt = normalize_filepath(self.filepath)
+        orig_norm = normalize_filepath(self.original_filepath)
+        tgt_fp = normalize_filepath(self.filepath)
 
         # Check if the library is unloaded
-        orig_norm = normalize_filepath(self.original_filepath)
         if orig_norm in link_active_states and not link_active_states[orig_norm]:
             self.report({'WARNING'}, "Turn visibility ON for switching resolution")
             return {'CANCELLED'}
 
+        hi_fp = get_hi_res_path(orig_norm)
+        lo_fp = hi_fp[:-6] + LO_SUFFIX
         lib = next((l for l in bpy.data.libraries if normalize_filepath(l.filepath) in {hi_fp, lo_fp}), None)
         if not lib:
             self.report({'ERROR'}, "Linked library not found")
@@ -606,7 +610,7 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
         if normalize_filepath(lib.filepath) == hi_fp:
             linked_elements[hi_fp] = get_linked_item_names(lib)
 
-        if tgt == hi_fp:
+        if tgt_fp == hi_fp:
             hid = next((h for h in ephemerally_loaded_libraries if normalize_filepath(h.filepath) == hi_fp), None)
             if hid:
                 bpy.data.libraries.remove(hid)
@@ -617,7 +621,7 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
         linked_elements[current_fp] = get_linked_item_names(lib)
         transforms = linked_elements[current_fp].get('transforms', {})
 
-        lib.filepath = tgt
+        lib.filepath = tgt_fp
         reload_library(lib)
 
         col = context.view_layer.active_layer_collection.collection
@@ -628,7 +632,6 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
             if coll.library == lib and coll.name not in col.children:
                 col.children.link(coll)
 
-        tgt_fp = normalize_filepath(tgt)
         linked_elements[tgt_fp] = get_linked_item_names(lib)
         if linked_elements[tgt_fp].get('type') == 'collections':
             for coll_name in linked_elements[tgt_fp].get('collections', []):
@@ -641,16 +644,32 @@ class LINKEDITOR_OT_switch_mode(bpy.types.Operator, ImportHelper):
                             obj.scale = transforms[coll_name].get('scale', [1, 1, 1])
                             break
 
-        rs = resolution_status.setdefault(hi_fp, {"high_path": hi_fp, "low_path": lo_fp})
-        rs["status"] = "high" if tgt == hi_fp else "low"
+        # determine high and low paths
+        is_orig_lo = resolution_status.get(orig_norm, {}).get("status") == "low" or is_lo_file(orig_norm)
+        is_target_lo = not is_orig_lo
+        high_path = orig_norm if is_target_lo else tgt_fp
+        low_path = tgt_fp if is_target_lo else orig_norm
 
-        tgt_norm = normalize_filepath(tgt)
+        # update resolution_status for both
+        for key in [high_path, low_path]:
+            status = "high" if key == high_path else "low"
+            high_res_for_render = resolution_status.get(key, {}).get("high_res_for_render", False)
+            resolution_status[key] = {
+                "status": status,
+                "high_path": high_path,
+                "low_path": low_path,
+                "high_res_for_render": high_res_for_render,
+            }
+
         if orig_norm in library_order:
             idx = library_order.index(orig_norm)
-            library_order[idx] = tgt_norm
+            library_order[idx] = tgt_fp
 
         if orig_norm in link_active_states:
-            link_active_states[tgt_norm] = link_active_states.pop(orig_norm)
+            link_active_states[tgt_fp] = link_active_states.pop(orig_norm)
+
+        if orig_norm in expanded_states:
+            expanded_states[tgt_fp] = expanded_states.pop(orig_norm)
 
         force_viewport_refresh()
         return {'FINISHED'}
@@ -690,7 +709,7 @@ class LINKEDITOR_PT_panel(bpy.types.Panel):
             is_loaded = link_active_states.get(live_fp, True)
             row.operator("linkeditor.load_and_unload", text="",
                          icon="HIDE_OFF" if is_loaded else "HIDE_ON").filepath = live_fp
-            is_lo = is_lo_file(abs_fp)
+            is_lo = resolution_status.get(live_fp, {}).get("status") == "low" or (live_fp not in resolution_status and is_lo_file(live_fp))
             row.operator("linkeditor.switch_mode", text="",
                          icon="SPLIT_HORIZONTAL" if is_lo else "VIEW_ORTHO").original_filepath = live_fp
             if is_lo:
